@@ -26,6 +26,10 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import os
+
+# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"        # 单个GPU的最大使用率
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"                    # 指定当前程序 “可见” 的 GPU 设备编号
 
 
 def init_logging():
@@ -194,6 +198,14 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+
+    # 新增：初始化JAX分布式环境（单节点多GPU也需要）
+    if jax.process_count() > 1:  # 检测是否多进程
+        jax.distributed.initialize(
+            coordinator_address="localhost:12345",  # 主节点地址和端口（确保不冲突）
+            num_processes=jax.process_count(),      # 总进程数
+            process_id=jax.process_index(),         # 当前进程ID
+        )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(

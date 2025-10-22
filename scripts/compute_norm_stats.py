@@ -14,7 +14,9 @@ import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
-
+import os
+# 设置 LeRobot 数据集根目录（本地路径）
+os.environ["LEROBOT_DATASETS_DIR"] = "/liury/data"
 
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:

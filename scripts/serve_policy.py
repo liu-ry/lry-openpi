@@ -9,7 +9,8 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"                    # 指定当前程序 “可见” 的 GPU 设备编号
 
 class EnvMode(enum.Enum):
     """Supported environments."""
@@ -47,7 +48,7 @@ class Args:
     default_prompt: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8000
+    port: int = 8099
     # Record the policy's behavior for debugging.
     record: bool = False
 

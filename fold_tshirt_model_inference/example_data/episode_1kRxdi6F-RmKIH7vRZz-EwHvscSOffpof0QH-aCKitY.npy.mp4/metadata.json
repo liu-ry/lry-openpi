@@ -1,0 +1,22 @@
+{
+  "task_name": "Folding tshirt pile and stacking",
+  "env_loop_frequency": 30,
+  "duration": 182.5863356590271,
+  "arm_type": "yam",
+  "world_frame": "left_arm",
+  "extrinsics": {
+    "right_arm_extrinsic": {
+      "position": [
+        0,
+        -0.61,
+        0
+      ],
+      "rotation": [
+        1,
+        0,
+        0,
+        0
+      ]
+    }
+  }
+}

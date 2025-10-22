@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.vitai_pi05_policy as vitai_pi05_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -276,6 +277,57 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotViTaiPI05DataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    action_sequence_keys: Sequence[str] = ("actions",)
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[ # @liury TODO: change these keys to match your dataset
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "img_high_camera",
+                            "cam_left_wrist": "img_left_camera",
+                            "cam_right_wrist": "img_right_camera",
+                        },
+                        "state": "state",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+        
+        data_transforms = _transforms.Group(
+            inputs=[vitai_pi05_policy.ViTaiPI05Inputs(model_type=model_config.model_type, action_dim=32),],
+            outputs=[vitai_pi05_policy.ViTaiPI05Outputs()],
+        )
+        
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1) 
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
@@ -587,6 +639,23 @@ _CONFIGS = [
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     #
+    # Inference ViTai05 configs.
+    #
+    TrainConfig(
+        name="pi05_vitai",
+        model=pi0_config.Pi0Config(action_horizon=10, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="vitai"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[vitai_pi05_policy.ViTaiPI05Inputs(model_type=ModelType.PI05)],
+                outputs=[vitai_pi05_policy.ViTaiPI05Outputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),  
+    #
     # Inference DROID configs.
     #
     TrainConfig(
@@ -739,7 +808,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=255,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -752,6 +821,52 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    #
+    # Fine-tuning ViTai configs.
+    # 
+    TrainConfig(
+        name="pi05_vitai_fold_tshirt",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", 
+                                   action_expert_variant="gemma_300m_lora", 
+                                   pi05=True),
+        freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+        data=LeRobotViTaiPI05DataConfig(
+            repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
+            extra_delta_transform=False,
+            default_prompt="clean_table",
+            assets=AssetsConfig(
+                assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",     #  需要动态的调整路径
+                asset_id="clean_table",                          #  需要动态的调整路径
+            ),
+        ),
+        # data=LeRobotViTaiPI05DataConfig(
+        #     repo_id="/liury/data/converted_buy_dataset",                     #  需要动态的调整路径    
+        #     extra_delta_transform=False,
+        #     default_prompt="fold tshirt",
+        #     assets=AssetsConfig(
+        #         assets_dir="/liury/data/converted_buy_dataset/assets",     #  需要动态的调整路径
+        #         asset_id="fold_tshirt",                          #  需要动态的调整路径
+        #     ),
+        # ),
+
+        batch_size=4,                                                # @liury TODO: 这里的batch size可以根据显存情况进行调整
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/liury/models/local_pi05_base/pi05_base/params"), #  需要动态的调整路径
+        # pytorch_weight_path="/liury/models/local_pi05_base_converted",
+        num_train_steps=40_000,
+        keep_period=5000,
+        save_interval=5000
+    ),      
     #
     # Fine-tuning Aloha configs.
     #
