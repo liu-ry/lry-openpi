@@ -312,14 +312,25 @@ class PromptFromLeRobotTask(DataTransformFn):
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     tasks: dict[int, str]
+    task_idx_offset: int = 50
 
     def __call__(self, data: DataDict) -> DataDict:
         if "task_index" not in data:
             raise ValueError('Cannot extract prompt without "task_index"')
 
-        task_index = int(data["task_index"])
-        if (prompt := self.tasks.get(task_index)) is None:
-            raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
+        if "dataset_index" not in data:
+            task_index = int(data["task_index"])
+            if (prompt := self.tasks.get(task_index)) is None:
+                raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
+        else:
+            dataset_idx = int(data["dataset_index"])  # 来自哪个数据集（0、1、2...）
+            original_task_idx = int(data["task_index"])  # 该数据集内的原始 task_index     
+            global_task_idx = dataset_idx * self.task_idx_offset + original_task_idx   
+            if (prompt := self.tasks.get(global_task_idx)) is None:
+                raise ValueError(
+                    f"Global {global_task_idx=} (dataset_idx={dataset_idx}, original_task_idx={original_task_idx}) "
+                    f"not found in merged task mapping: {self.tasks}"
+                )    
 
         return {**data, "prompt": prompt}
 

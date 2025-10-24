@@ -131,23 +131,60 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
-    if repo_id is None:
+    repo_ids = data_config.repo_id
+    if repo_ids is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
-    if repo_id == "fake":
+    if repo_ids == ["fake"]:
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-        tolerance_s=0.01,
-    )
+    if len(repo_ids) > 1:
+        # （可选）为每个数据集设置时间容忍度（默认均为 0.01s，可按需求调整）
+        tolerances_s = {repo_id: 0.01 for repo_id in repo_ids}
+        # （可选）为每个数据集设置 delta_timestamps（按 action_horizon 计算）
+        delta_timestamps = {
+            key: [t / lerobot_dataset.LeRobotDatasetMetadata(repo_id).fps 
+                  for t in range(action_horizon)] 
+            for repo_id in repo_ids
+            for key in data_config.action_sequence_keys
+        }
+        
+        # 创建 MultiLeRobotDataset（核心：传入 repo_ids 列表，而非单个 repo_id）
+        dataset = lerobot_dataset.MultiLeRobotDataset(
+            repo_ids=repo_ids,  # 多数据集的 repo_id 列表
+            # root=HF_LEROBOT_HOME,  # 数据集根目录（与单数据集一致）
+            delta_timestamps=delta_timestamps,  # 时间差配置
+            tolerances_s=tolerances_s,  # 每个数据集的时间容忍度
+        )       
+    else:
+        repo_id = repo_ids[0]
+         # 创建单一 LeRobotDataset            
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+            tolerance_s=0.01,
+        )
 
+    # 4. 保留 prompt 提取逻辑（多数据集通用：每个样本的 task_index 对应自身数据集的 task）
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # 关键：多数据集需合并所有数据集的 tasks（dataset.tasks 是 {repo_id: {task_idx: prompt}} 结构）
+        if isinstance(dataset, lerobot_dataset.MultiLeRobotDataset):
+            # 合并所有子数据集的 tasks：{task_idx + 子数据集偏移: prompt}（避免 task_idx 冲突）
+            merged_tasks = {}
+            task_idx_offset = 50  # 偏移量：确保不同数据集的 task_idx 不重复
+            for dataset_idx, repo_id in enumerate(repo_ids):
+                sub_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+                # 偏移公式：偏移后 task_index = 数据集索引 × 偏移系数 + 原 task_index
+                for sub_task_idx, prompt in sub_meta.tasks.items():
+                    global_task_idx = dataset_idx * task_idx_offset + sub_task_idx
+                    merged_tasks[global_task_idx] = prompt
+        else:
+            # 单数据集：直接使用原有 tasks
+            merged_tasks = dataset_meta.tasks
+
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(merged_tasks)])
 
     return dataset
 

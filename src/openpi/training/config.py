@@ -64,7 +64,7 @@ class AssetsConfig:
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    repo_id: list[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -166,7 +166,7 @@ class ModelTransformFactory(GroupFactory):
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    repo_id: list[str] = tyro.MISSING
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -302,6 +302,7 @@ class LeRobotViTaiPI05DataConfig(DataConfigFactory):
                         },
                         "state": "state",
                         "actions": "actions",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -832,15 +833,16 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(
                 paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
             ).get_freeze_filter(),
-        data=LeRobotViTaiPI05DataConfig(
-            repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
-            extra_delta_transform=False,
-            default_prompt="clean_table",
-            assets=AssetsConfig(
-                assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",     #  需要动态的调整路径
-                asset_id="clean_table",                          #  需要动态的调整路径
-            ),
-        ),
+        # data=LeRobotViTaiPI05DataConfig(
+        #     repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
+        #     extra_delta_transform=False,
+        #     base_config=DataConfig(prompt_from_task=True),
+        #     default_prompt="clean_table",
+        #     assets=AssetsConfig(
+        #         assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",     #  需要动态的调整路径
+        #         asset_id="clean_table",                          #  需要动态的调整路径
+        #     ),
+        # ),
         # data=LeRobotViTaiPI05DataConfig(
         #     repo_id="/liury/data/converted_buy_dataset",                     #  需要动态的调整路径    
         #     extra_delta_transform=False,
@@ -848,6 +850,27 @@ _CONFIGS = [
         #     assets=AssetsConfig(
         #         assets_dir="/liury/data/converted_buy_dataset/assets",     #  需要动态的调整路径
         #         asset_id="fold_tshirt",                          #  需要动态的调整路径
+        #     ),
+        # ),
+        data=LeRobotViTaiPI05DataConfig(
+            repo_id=["/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile",
+                     "/data/vitai_vtla_dataset/converted_dataset/clean_pepsi_trash"],                     #  需要动态的调整路径    
+            extra_delta_transform=False,
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="clean_table",
+            assets=AssetsConfig(
+                assets_dir="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile/assets",#  需要动态的调整路径
+                asset_id="clean_table",                          #  需要动态的调整路径
+            ),
+        ),
+        # data=LeRobotViTaiPI05DataConfig(
+        #     repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
+        #     extra_delta_transform=False,
+        #     base_config=DataConfig(prompt_from_task=True),
+        #     default_prompt="clean_table",
+        #     assets=AssetsConfig(
+        #         assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",#  需要动态的调整路径
+        #         asset_id="clean_table",                          #  需要动态的调整路径
         #     ),
         # ),
 
