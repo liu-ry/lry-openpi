@@ -21,6 +21,9 @@ class Pi0Config(_model.BaseModelConfig):
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
 
+    # 视触觉配置
+    use_tactile: bool = False
+    
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
@@ -56,18 +59,43 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+         # 基础图像配置
+        images = {
+            "base_0_rgb": image_spec,
+            "front_0_rgb": image_spec,
+            "left_wrist_0_rgb": image_spec,
+            "right_wrist_0_rgb": image_spec,
+        }
+        image_masks = {
+            "base_0_rgb": image_mask_spec,
+            "front_0_rgb": image_mask_spec,
+            "left_wrist_0_rgb": image_mask_spec,
+            "right_wrist_0_rgb": image_mask_spec,
+        }
+
+        # 如果使用触觉，添加触觉图像规格
+        if self.use_tactile:
+            tactile_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+            for tactile_key in _model.TACTILE_KEYS:
+                images[tactile_key] = tactile_spec
+                image_masks[tactile_key] = image_mask_spec
+            for depth_key in _model.TACTILE_DEPTH_KEYS:
+                images[depth_key] = tactile_spec
+                image_masks[depth_key] = image_mask_spec
+
+        # Marker 数据添加
+        marker = {
+            "left1_marker": jax.ShapeDtypeStruct([batch_size, 81, 3], jnp.float32),
+            "left2_marker": jax.ShapeDtypeStruct([batch_size, 81, 3], jnp.float32),
+            "right1_marker": jax.ShapeDtypeStruct([batch_size, 81, 3], jnp.float32),
+            "right2_marker": jax.ShapeDtypeStruct([batch_size, 81, 3], jnp.float32),
+        }
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images=images,
+                image_masks=image_masks,
+                markers=marker,
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -103,6 +131,7 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*marker_proj.*")))
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)

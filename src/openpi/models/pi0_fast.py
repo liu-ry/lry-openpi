@@ -78,6 +78,9 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
 
+    # 视触觉配置
+    use_tactile: bool = False
+
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 32
@@ -102,18 +105,29 @@ class Pi0FASTConfig(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        # 基础图像配置
+        images_spec = {
+            "base_0_rgb": image_spec,
+            "base_1_rgb": image_spec,
+            "wrist_0_rgb": image_spec,
+        }
+        image_masks_spec = {
+            "base_0_rgb": image_mask_spec,
+            "base_1_rgb": image_mask_spec,
+            "wrist_0_rgb": image_mask_spec,
+        }
+
+        # 如果使用触觉，添加触觉图像
+        if self.use_tactile:
+            tactile_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+            for tactile_key in _model.TACTILE_KEYS:
+                images_spec[tactile_key] = tactile_spec
+                image_masks_spec[tactile_key] = image_mask_spec
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "base_1_rgb": image_spec,
-                    "wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "base_1_rgb": image_mask_spec,
-                    "wrist_0_rgb": image_mask_spec,
-                },
+                images=images_spec,
+                image_masks=image_masks_spec,
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -134,6 +148,8 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.use_tactile = config.use_tactile
+
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
@@ -199,7 +215,7 @@ class Pi0FAST(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
+            rng, observation, train=train, image_keys=list(observation.images.keys()), use_tactile=self.use_tactile
         )
 
         # Compute inputs: one big forward pass of prefix + suffix at once
@@ -243,7 +259,7 @@ class Pi0FAST(_model.BaseModel):
     ) -> _model.Actions:
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
-            None, observation, train=False, image_keys=list(observation.images.keys())
+            None, observation, train=False, image_keys=list(observation.images.keys()), use_tactile=self.use_tactile
         )
 
         # embed inputs

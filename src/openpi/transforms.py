@@ -312,7 +312,7 @@ class PromptFromLeRobotTask(DataTransformFn):
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     tasks: dict[int, str]
-    task_idx_offset: int = 50
+    task_idx_offset: int = 1000
 
     def __call__(self, data: DataDict) -> DataDict:
         if "task_index" not in data:

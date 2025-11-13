@@ -48,18 +48,11 @@ IMAGE_KEYS = (
 # 定义触觉相关的常量
 TACTILE_KEYS = (
     "left1_tactile_rgb",
-    "left2_tactile_rgb", 
+    "left2_tactile_rgb",
     "right1_tactile_rgb",
     "right2_tactile_rgb",
 )
 
-# 定义触觉Depth相关的常量
-TACTILE_DEPTH_KEYS = (
-    "left1_tactile_depth", 
-    "left2_tactile_depth", 
-    "right1_tactile_depth", 
-    "right2_tactile_depth",
-)
 
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
@@ -111,8 +104,6 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
-    # tactile whith marker format (b*81*3)
-    markers: dict[str, at.Float[ArrayT, "*b i v"]]
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -142,7 +133,6 @@ class Observation(Generic[ArrayT]):
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
-            markers=data["marker"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -183,7 +173,6 @@ def preprocess_observation(
     image_keys = list(image_keys)
     if use_tactile:
         image_keys.extend(TACTILE_KEYS)
-        image_keys.extend(TACTILE_DEPTH_KEYS)
 
     logger.info(f"use_tactile: {use_tactile}")
 
@@ -231,7 +220,6 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
-        markers=observation.markers,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

@@ -19,7 +19,6 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
-import openpi.policies.vitai_pi05_policy as vitai_pi05_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -28,6 +27,9 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+
+import openpi.policies.vitai_policy as vitai_policy
+
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -67,6 +69,10 @@ class DataConfig:
     repo_id: list[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
+    # root
+    root: str | None = None
+    # tolerance_s
+    tolerance_s: float | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
@@ -96,6 +102,8 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
+
+    n_hours: int | None = None # If set, limits the dataset to n hours of data.
 
 
 class GroupFactory(Protocol):
@@ -167,6 +175,13 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: list[str] = tyro.MISSING
+
+    root: str = tyro.MISSING
+
+    tolerance_s: float = tyro.MISSING
+
+    n_hours: int = tyro.MISSING # If set, limits the dataset to n hours of data.
+
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -179,10 +194,16 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        root = self.root if self.root is not tyro.MISSING else None
+        tolerance_s = self.tolerance_s if self.tolerance_s is not tyro.MISSING else 1e-4
+        n_hours = self.n_hours if self.n_hours is not tyro.MISSING else None
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            root=root,
+            tolerance_s=tolerance_s,
+            n_hours=n_hours,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
@@ -277,58 +298,6 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
-@dataclasses.dataclass(frozen=True)
-class LeRobotViTaiPI05DataConfig(DataConfigFactory):
-    """
-    This config is used to configure transforms that are applied at various parts of the data pipeline.
-    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
-    comments below.
-    """
-
-    extra_delta_transform: bool = False
-    action_sequence_keys: Sequence[str] = ("actions",)
-    default_prompt: str | None = None
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[ # @liury TODO: change these keys to match your dataset
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "img_high_camera",
-                            "cam_left_wrist": "img_left_camera",
-                            "cam_right_wrist": "img_right_camera",
-                        },
-                        "state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        
-        data_transforms = _transforms.Group(
-            inputs=[vitai_pi05_policy.ViTaiPI05Inputs(model_type=model_config.model_type, action_dim=32),],
-            outputs=[vitai_pi05_policy.ViTaiPI05Outputs()],
-        )
-        
-        if self.extra_delta_transform:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1) 
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-        
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
-        )
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
@@ -600,6 +569,69 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotViTaiDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = True
+
+    use_xdof_bool_mask: bool = False
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[vitai_policy.ViTaiInputs(action_dim=model_config.action_dim)],
+            outputs=[vitai_policy.ViTaiOutputs()],
+        )
+        print(f'self.use_delta_joint_actions {self.use_delta_joint_actions}')
+        print(f'self.use_xdof_bool_mask {self.use_xdof_bool_mask}')
+
+        if self.use_delta_joint_actions:
+
+            if self.use_xdof_bool_mask:
+                delta_action_mask = _transforms.make_bool_mask(6, -1, -6, -1)
+            else:
+                delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -639,23 +671,6 @@ _CONFIGS = [
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
-    #
-    # Inference ViTai05 configs.
-    #
-    TrainConfig(
-        name="pi05_vitai",
-        model=pi0_config.Pi0Config(action_horizon=10, pi05=True),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="vitai"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[vitai_pi05_policy.ViTaiPI05Inputs(model_type=ModelType.PI05)],
-                outputs=[vitai_pi05_policy.ViTaiPI05Outputs()],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),  
     #
     # Inference DROID configs.
     #
@@ -809,7 +824,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=255,
+        batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -822,74 +837,6 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    #
-    # Fine-tuning ViTai configs.
-    # 
-    TrainConfig(
-        name="pi05_vitai_fold_tshirt",
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", 
-                                   action_expert_variant="gemma_300m_lora", 
-                                   pi05=True),
-        freeze_filter=pi0_config.Pi0Config(
-                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-            ).get_freeze_filter(),
-        # data=LeRobotViTaiPI05DataConfig(
-        #     repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
-        #     extra_delta_transform=False,
-        #     base_config=DataConfig(prompt_from_task=True),
-        #     default_prompt="clean_table",
-        #     assets=AssetsConfig(
-        #         assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",     #  需要动态的调整路径
-        #         asset_id="clean_table",                          #  需要动态的调整路径
-        #     ),
-        # ),
-        # data=LeRobotViTaiPI05DataConfig(
-        #     repo_id="/liury/data/converted_buy_dataset",                     #  需要动态的调整路径    
-        #     extra_delta_transform=False,
-        #     default_prompt="fold tshirt",
-        #     assets=AssetsConfig(
-        #         assets_dir="/liury/data/converted_buy_dataset/assets",     #  需要动态的调整路径
-        #         asset_id="fold_tshirt",                          #  需要动态的调整路径
-        #     ),
-        # ),
-        data=LeRobotViTaiPI05DataConfig(
-            repo_id=["/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile",
-                     "/data/vitai_vtla_dataset/converted_dataset/clean_pepsi_trash"],                     #  需要动态的调整路径    
-            extra_delta_transform=False,
-            base_config=DataConfig(prompt_from_task=True),
-            default_prompt="clean_table",
-            assets=AssetsConfig(
-                assets_dir="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile/assets",#  需要动态的调整路径
-                asset_id="clean_table",                          #  需要动态的调整路径
-            ),
-        ),
-        # data=LeRobotViTaiPI05DataConfig(
-        #     repo_id="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile",                     #  需要动态的调整路径    
-        #     extra_delta_transform=False,
-        #     base_config=DataConfig(prompt_from_task=True),
-        #     default_prompt="clean_table",
-        #     assets=AssetsConfig(
-        #         assets_dir="/data/vitai_vtla_dataset/clean_table_52/converted_clean_table_dataset_with_tactile/assets",#  需要动态的调整路径
-        #         asset_id="clean_table",                          #  需要动态的调整路径
-        #     ),
-        # ),
-
-        batch_size=4,                                                # @liury TODO: 这里的batch size可以根据显存情况进行调整
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/liury/models/local_pi05_base/pi05_base/params"), #  需要动态的调整路径
-        # pytorch_weight_path="/liury/models/local_pi05_base_converted",
-        num_train_steps=40_000,
-        keep_period=5000,
-        save_interval=5000
-    ),      
     #
     # Fine-tuning Aloha configs.
     #
@@ -1094,6 +1041,314 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+
+
+    TrainConfig(
+            name="pi05_vitai_local_small",
+            # model=pi0.Pi0Config(),
+            model=pi0_config.Pi0Config(pi05=True, 
+                                       use_tactile=False,
+                                       paligemma_variant="gemma_2b_lora", 
+                                       action_expert_variant="gemma_300m_lora"),
+            freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+            batch_size=32,
+            # lr_schedule=_optimizer.CosineDecaySchedule(
+            #     warmup_steps=1_000,
+            #     peak_lr=3e-6,
+            #     decay_steps=30_000,
+            #     decay_lr=3e-7,
+            # ),
+            data=LeRobotViTaiDataConfig(
+                repo_id="fold_tshirt_50",
+                root="/data/vitai_fold_tshirt_50",
+                tolerance_s=1e-3,
+                assets=AssetsConfig(
+                    assets_dir="/data/vitai_fold_tshirt_50/assets",
+                    asset_id="fold_tshirt_50",
+                ),
+                default_prompt="fold tshirt pile and stacking",
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "observation.images.cam_high",
+                                    "cam_left_wrist": "observation.images.cam_left_wrist",
+                                    "cam_right_wrist": "observation.images.cam_right_wrist",
+                                    # 视触觉传感器 - 如果数据中有这些，就映射
+                                    "left1_tactile_rgb": "observation.images.cam_left_wrist",
+                                    "left2_tactile_rgb": "observation.images.cam_left_wrist",
+                                    "right1_tactile_rgb": "observation.images.cam_right_wrist",
+                                    "right2_tactile_rgb": "observation.images.cam_right_wrist",
+                                },
+                                "state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt"
+                            }
+                        )
+                    ]
+                ),
+                # use_xdof_bool_mask=True
+                use_delta_joint_actions=False,
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+            # weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi0_base/params"),
+            num_train_steps=200_000,
+            wandb_enabled=False,
+            keep_period=10000
+        ),
+
+
+    TrainConfig(
+            name="pi05_vitai_local",
+            model=pi0_config.Pi0Config(pi05=True, 
+                                       use_tactile=False,
+                                       paligemma_variant="gemma_2b_lora", 
+                                       action_expert_variant="gemma_300m_lora"),
+            freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+            batch_size=32,
+            # lr_schedule=_optimizer.CosineDecaySchedule(
+            #     warmup_steps=1_000,
+            #     peak_lr=3e-6,
+            #     decay_steps=30_000,
+            #     decay_lr=3e-7,
+            # ),
+            data=LeRobotViTaiDataConfig(
+                repo_id="fold_tshirt_4000",
+                root="/data/vitai_fold_tshirt",
+                tolerance_s=1e-3,
+                assets=AssetsConfig(
+                    assets_dir="/data/vitai_fold_tshirt/assets",
+                    asset_id="fold_tshirt_4000",
+                ),
+                default_prompt="fold tshirt pile and stacking",
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "observation.images.cam_high",
+                                    "cam_left_wrist": "observation.images.cam_left_wrist",
+                                    "cam_right_wrist": "observation.images.cam_right_wrist",
+                                    # 视触觉传感器 - 如果数据中有这些，就映射
+                                    "left1_tactile_rgb": "observation.images.cam_left_wrist",
+                                    "left2_tactile_rgb": "observation.images.cam_left_wrist",
+                                    "right1_tactile_rgb": "observation.images.cam_right_wrist",
+                                    "right2_tactile_rgb": "observation.images.cam_right_wrist",
+                                },
+                                "state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt"
+                            }
+                        )
+                    ]
+                ),
+                use_delta_joint_actions=False,
+                n_hours=20 # use n hours of data for quick training
+            ),
+            # weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+            # weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi0_base/params"),
+            num_train_steps=200_000,
+            wandb_enabled=False,
+            keep_period=10000,
+            resume=True
+        ),
+
+    
+    TrainConfig(
+            name="pi05_clean_table_with_tactile",
+            model=pi0_config.Pi0Config(pi05=True, 
+                                       use_tactile=True,
+                                       paligemma_variant="gemma_2b_lora", 
+                                       action_expert_variant="gemma_300m_lora"),
+            freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+            batch_size=8,
+            # lr_schedule=_optimizer.CosineDecaySchedule(
+            #     warmup_steps=10_000,
+            #     peak_lr=5e-5,
+            #     decay_steps=1_000_000,
+            #     decay_lr=5e-5,
+            # ),
+            data=LeRobotViTaiDataConfig(
+                repo_id="converted_clean_table_dataset_with_tactile",
+                root="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile",
+                tolerance_s=1e-3,
+                assets=AssetsConfig(
+                    assets_dir="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile/assets",
+                    asset_id="clean_table",
+                ),
+                default_prompt="Clean the table by putting all the items into the box",
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "img_high_camera",
+                                    "cam_left_wrist": "img_left_camera",
+                                    "cam_right_wrist": "img_right_camera",
+                                    # 视触觉传感器 - 如果数据中有这些，就映射
+                                    "left1_tactile_rgb": "left1_warped-images",
+                                    "left2_tactile_rgb": "left2_warped-images",
+                                    "right1_tactile_rgb": "right1_warped-images",
+                                    "right2_tactile_rgb": "right2_warped-images",
+                                },
+                                "state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt"
+                            }
+                        )
+                    ]
+                ),
+                action_sequence_keys = ("actions",),
+                use_delta_joint_actions=False,
+                n_hours=20, # use n hours of data for quick training
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+            # resume=True,
+            num_train_steps=40_000,
+            wandb_enabled=False,
+            keep_period=5000
+        ),
+
+    TrainConfig(
+            name="pi05_clean_table_without_tactile",
+            model=pi0_config.Pi0Config(pi05=True, 
+                                       use_tactile=False,
+                                       paligemma_variant="gemma_2b_lora", 
+                                       action_expert_variant="gemma_300m_lora"),
+            freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+            batch_size=8,
+            # lr_schedule=_optimizer.CosineDecaySchedule(
+            #     warmup_steps=10_000,
+            #     peak_lr=5e-5,
+            #     decay_steps=1_000_000,
+            #     decay_lr=5e-5,
+            # ),
+            data=LeRobotViTaiDataConfig(
+                repo_id="converted_clean_table_dataset_with_tactile",
+                root="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile",
+                tolerance_s=1e-3,
+                assets=AssetsConfig(
+                    assets_dir="/data/vitai_vtla_dataset/converted_dataset/converted_clean_table_dataset_with_tactile/assets",
+                    asset_id="clean_table",
+                ),
+                default_prompt="Clean the table by putting all the items into the box",
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "img_high_camera",
+                                    "cam_left_wrist": "img_left_camera",
+                                    "cam_right_wrist": "img_right_camera",
+                                    # 视触觉传感器 - 如果数据中有这些，就映射
+                                    "left1_tactile_rgb": "left1_warped-images",
+                                    "left2_tactile_rgb": "left2_warped-images",
+                                    "right1_tactile_rgb": "right1_warped-images",
+                                    "right2_tactile_rgb": "right2_warped-images",
+                                },
+                                "state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt"
+                            }
+                        )
+                    ]
+                ),
+                action_sequence_keys = ("actions",),
+                use_delta_joint_actions=False,
+                n_hours=20, # use n hours of data for quick training
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+            # resume=True,
+            num_train_steps=40_000,
+            wandb_enabled=False,
+            keep_period=5000
+        ),
+
+   TrainConfig(
+            name="pi05_peg_in_hole",
+            model=pi0_config.Pi0Config(pi05=True, 
+                                       use_tactile=True,
+                                       paligemma_variant="gemma_2b_lora", 
+                                       action_expert_variant="gemma_300m_lora"),
+            freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            # Turn off EMA for LoRA finetuning.
+            ema_decay=None,
+            batch_size=3,
+            # lr_schedule=_optimizer.CosineDecaySchedule(
+            #     warmup_steps=10_000,
+            #     peak_lr=5e-5,
+            #     decay_steps=1_000_000,
+            #     decay_lr=5e-5,
+            # ),
+            data=LeRobotViTaiDataConfig(
+                repo_id=["/data/vitai_vtla_dataset/converted_dataset/09_converted_circular_pentagon"],
+                root="/data/vitai_vtla_dataset/converted_dataset/09_converted_circular_pentagon",
+                tolerance_s=1e-3,
+                assets=AssetsConfig(
+                    assets_dir="/data/vitai_vtla_dataset/assets",
+                    asset_id="09",
+                ),
+                default_prompt="Pull out the circular peg on the left and insert it into the circular hole on the right",
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "observation.images.cam_high",
+                                    "cam_front": "observation.images.cam_front",
+                                    "cam_left_wrist": "observation.images.cam_left_wrist",
+                                    "cam_right_wrist": "observation.images.cam_right_wrist",
+                                    # 视触觉传感器 - 如果数据中有这些，就映射
+                                    "left1_tactile_rgb": "observation.images.left1_warped-images",
+                                    "left2_tactile_rgb": "observation.images.left2_warped-images",
+                                    "right1_tactile_rgb": "observation.images.right1_warped-images",
+                                    "right2_tactile_rgb": "observation.images.right2_warped-images",
+                                    # depth 图像
+                                    "left1_tactile_depth": "observation.images.left1_warped-depth-images",
+                                    "left2_tactile_depth": "observation.images.left2_warped-depth-images",
+                                    "right1_tactile_depth": "observation.images.right1_warped-depth-images",
+                                    "right2_tactile_depth": "observation.images.right2_warped-depth-images",
+                                },
+                                "state": "observation.state",
+                                "actions": "actions",
+                                "prompt": "prompt"
+                            }
+                        )
+                    ]
+                ),
+                action_sequence_keys = ("actions",),
+                use_delta_joint_actions=False,
+                n_hours=20, # use n hours of data for quick training
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+            # resume=True,
+            num_train_steps=50_000,
+            wandb_enabled=False,
+            keep_period=10000
+        ),
+
     #
     # RoboArena configs.
     #

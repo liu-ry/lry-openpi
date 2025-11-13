@@ -2,7 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -14,7 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
-import wandb
+# import wandb
+from torch.utils.tensorboard import SummaryWriter  # 替换 wandb
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -28,7 +29,9 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -49,27 +52,33 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
+def init_tensorboard(log_dir: str) -> SummaryWriter:
+    """Initialize TensorBoard SummaryWriter."""
+    return SummaryWriter(log_dir=log_dir)
 
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+# def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+#     if not enabled:
+#         wandb.init(mode="disabled")
+#         return
+#
+#     ckpt_dir = config.checkpoint_dir
+#     if not ckpt_dir.exists():
+#         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+#     if resuming:
+#         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+#         wandb.init(id=run_id, resume="must", project=config.project_name)
+#     else:
+#         wandb.init(
+#             name=config.exp_name,
+#             config=dataclasses.asdict(config),
+#             mode="offline",
+#             project=config.project_name,
+#         )
+#         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+#
+#     if log_code:
+#         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -82,12 +91,30 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
+@runtime_checkable
+class OptimizerConfig(Protocol):
+    def create(
+        self,
+        lr: optax.ScalarOrSchedule,
+        weight_decay_mask: at.PyTree | None = None,
+    ) -> optax.GradientTransformation: ...
+
+
+def create_optimizer(
+    optimizer: OptimizerConfig,
+    lr_schedule: optax.Schedule,  # 改为接收实例
+    weight_decay_mask: at.PyTree | None = None
+) -> optax.GradientTransformation:
+    return optimizer.create(lr_schedule, weight_decay_mask)
 
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    lr_schedule = config.lr_schedule.create()  # 提前创建
+    tx = create_optimizer(config.optimizer, lr_schedule,weight_decay_mask=None)
+
+    # tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -113,6 +140,7 @@ def init_train_state(
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
+            lr_schedule=lr_schedule
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -217,23 +245,26 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    # init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tb_writer = init_tensorboard(log_dir=str(config.checkpoint_dir / "tensorboard"))
 
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
+        skip_norm_stats=True,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # 将第一批图像保存到 TensorBoard
+    images_to_log = np.concatenate(
+        [np.array(img[0]) for img in batch[0].images.values()],  # 只取第一个样本
+        axis=1,
+    )
+    tb_writer.add_image("camera_views", images_to_log, global_step=0, dataformats="HWC")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -267,7 +298,17 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+
+            current_lr = float(jax.device_get(train_state.lr_schedule(train_state.step)))
+
+            # 记录到TensorBoard
+            if jax.process_index() == 0:  # 只在主进程记录
+                tb_writer.add_scalar("train/lr", current_lr, global_step=step)
+
+            # wandb.log(reduced_info, step=step)
+            # 记录到 TensorBoard
+            for k, v in reduced_info.items():
+                tb_writer.add_scalar(f"train/{k}", v, global_step=step)
             infos = []
         batch = next(data_iter)
 

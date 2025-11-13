@@ -18,9 +18,9 @@ class TrainState:
     model_def: nnx.GraphDef[_model.BaseModel]
     opt_state: optax.OptState
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
-
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
+    lr_schedule: optax.Schedule | None = struct.field(default=None, pytree_node=False)
 
 
 @at.typecheck

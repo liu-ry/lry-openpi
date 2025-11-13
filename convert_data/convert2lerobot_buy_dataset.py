@@ -7,9 +7,7 @@ from glob import glob
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 import tyro
 import cv2
-
-REPO_NAME = "/data/converted_buy_dataset_all"  # 输出数据集名称，用于Hugging Face Hub
-
+from pathlib import Path
 
 def extract_video_to_frames(video_path):
     """将视频文件转换为帧列表（使用 opencv）"""
@@ -49,50 +47,94 @@ def extract_video_to_frames(video_path):
     return frames
 
 
-def main(root_dir: str = "/data/vitai_fold_tshirt_raw_data", *, push_to_hub: bool = False):
+def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pick_and_place", 
+        output_dir: str = "/data/vitai_vtla_dataset/converted_dataset/converted_blue_cylinder_pick_and_place",
+        push_to_hub: bool = False):
     # 处理过程中错误的个数
     error_num = 0
     succ_num = 0
+    output_path = Path(output_dir)
     # 清理现有输出目录
-    output_path = HF_LEROBOT_HOME / REPO_NAME
     if output_path.exists():
-        shutil.rmtree(output_path)
+        # 提示用户确认，说明即将删除的目录
+        user_input = input(
+            f"目录 '{output_path}' 已存在，是否删除该目录及其所有内容？[y/N] "
+        ).strip().lower()  # 转为小写，方便判断
+        
+        # 仅当用户输入 'y' 或 'yes' 时执行删除
+        if user_input in ("y", "yes"):
+            print(f"正在删除目录: {output_path}")
+            shutil.rmtree(output_path)
+            print("删除完成")
+        else:
+            print("已取消删除以及数据转换操作")
+            return  
     # 检查root_dir是否存在
     if not os.path.exists(root_dir):
         raise ValueError(f"根目录不存在: {root_dir}")
 
     # 创建LeRobot数据集，定义要存储的特征
     dataset = LeRobotDataset.create(
-        repo_id=REPO_NAME,
+        repo_id=output_dir,
         robot_type="yam",  # 替换为您的机器人类型
         fps=30,  # 根据实际数据帧率调整
         features={
             # 相机图像特征
-            "img_high_camera": {
+            "observation.images.cam_high": {
                 "dtype": "image",
                 "shape": (480, 640, 3),  # 根据实际图像尺寸调整
                 "names": ["height", "width", "channel"],
             },
-            "img_left_camera": {
+            "observation.images.cam_left_wrist": {
                 "dtype": "image",
                 "shape": (480, 640, 3),
                 "names": ["height", "width", "channel"],
             },
-            "img_right_camera": {
+            "observation.images.cam_right_wrist": {
                 "dtype": "image",
                 "shape": (480, 640, 3),
                 "names": ["height", "width", "channel"],
             },
             # 关节和动作特征
-            "state": {
+            "observation.state": {
                 "dtype": "float32",
                 "shape": (14,),
-                "names": ["state"],
+                "names": [     
+                    "left_waist",
+                    "left_shoulder",
+                    "left_elbow",
+                    "left_forearm_roll",
+                    "left_wrist_angle",
+                    "left_wrist_rotate",
+                    "left_gripper",               
+                    "right_waist",
+                    "right_shoulder",
+                    "right_elbow",
+                    "right_forearm_roll",
+                    "right_wrist_angle",
+                    "right_wrist_rotate",
+                    "right_gripper"
+                    ],
             },
             "actions": {
                 "dtype": "float32",
                 "shape": (14,),
-                "names": ["actions"],
+                "names": [
+                    "left_waist",
+                    "left_shoulder",
+                    "left_elbow",
+                    "left_forearm_roll",
+                    "left_wrist_angle",
+                    "left_wrist_rotate",
+                    "left_gripper",               
+                    "right_waist",
+                    "right_shoulder",
+                    "right_elbow",
+                    "right_forearm_roll",
+                    "right_wrist_angle",
+                    "right_wrist_rotate",
+                    "right_gripper"
+                    ],
             # },
             # "timestamp": {
             #     "dtype": "float64",
@@ -143,9 +185,9 @@ def main(root_dir: str = "/data/vitai_fold_tshirt_raw_data", *, push_to_hub: boo
 
                     # 加载视频并转换为帧
                     video_files = {
-                        "img_high_camera": "top_camera-images-rgb.mp4",
-                        "img_left_camera": "left_camera-images-rgb.mp4",
-                        "img_right_camera": "right_camera-images-rgb.mp4",
+                        "observation.images.cam_high": "top_camera-images-rgb.mp4",
+                        "observation.images.cam_left_wrist": "left_camera-images-rgb.mp4",
+                        "observation.images.cam_right_wrist": "right_camera-images-rgb.mp4",
                     }
 
                     # 加载所有视频帧
@@ -161,7 +203,7 @@ def main(root_dir: str = "/data/vitai_fold_tshirt_raw_data", *, push_to_hub: boo
                         len(action_left_pos),
                         len(action_right_pos),
                         len(timestamps),
-                        len(video_frames["img_high_camera"])
+                        len(video_frames["observation.images.cam_high"])
                     ]
                     if len(set(lengths)) > 1:
                         print(f"警告: 数据长度不一致 {lengths}，跳过此episode")
@@ -196,12 +238,12 @@ def main(root_dir: str = "/data/vitai_fold_tshirt_raw_data", *, push_to_hub: boo
                         
                         frame_data = {
                             # 相机图像
-                            "img_high_camera": video_frames["img_high_camera"][step_idx],
-                            "img_left_camera": video_frames["img_left_camera"][step_idx],
-                            "img_right_camera": video_frames["img_right_camera"][step_idx],
+                            "observation.images.cam_high": video_frames["observation.images.cam_high"][step_idx],
+                            "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
+                            "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
                             
                             # 关节和动作数据
-                            "state": state,
+                            "observation.state": state,
                             "actions": actions,
                             # "timestamp": timestamps[step_idx],
                             

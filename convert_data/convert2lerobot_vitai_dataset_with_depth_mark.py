@@ -3,8 +3,7 @@ import shutil
 import json
 import numpy as np
 from glob import glob
-# from moviepy.editor import VideoFileClip
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tyro
 import cv2
 from pathlib import Path
@@ -52,11 +51,9 @@ def extract_video_to_frames(video_path, target_height=480, target_width=640):
 # root_dir : 原始数据集目录
 # output_dir : 转换后数据集存储目录名称
 # single_dir : 是否只处理单个目录，如果不是，则需要传入多个子目录的上一层目录路径为 root_dir
-# push_to_hub : 是否将转换后的数据集推送到Hugging Face Hub
 def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pick_and_place", 
         output_dir: str = "/data/vitai_vtla_dataset/converted_dataset/converted_blue_cylinder_pick_and_place",
-        single_dir: bool = False,
-        push_to_hub: bool = False):
+        single_dir: bool = False):
     error_num = 0
     succ_num = 0
     output_path = Path(output_dir)
@@ -122,6 +119,46 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                 "shape": (240, 240, 3),
                 "names": ["height", "width", "channel"],
             },
+            "observation.images.left1_warped-depth-images": {
+                "dtype": "image",
+                "shape": (240, 240, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.images.left2_warped-depth-images": {
+                "dtype": "image",
+                "shape": (240, 240, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.images.right1_warped-depth-images": {
+                "dtype": "image",
+                "shape": (240, 240, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.images.right2_warped-depth-images": {
+                "dtype": "image",
+                "shape": (240, 240, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "observation.left1_warped-marker": {
+                "dtype": "float32",
+                "shape": (81,3),
+                "names": ["marker_id", "xyz"],
+            },
+            "observation.left2_warped-marker": {
+                "dtype": "float32",
+                "shape": (81,3),
+                "names": ["marker_id", "xyz"],
+            },
+            "observation.right1_warped-marker": {
+                "dtype": "float32",
+                "shape": (81,3),
+                "names": ["marker_id", "xyz"],
+            },
+            # "observation.right2_warped-marker": {
+            #     "dtype": "float32",
+            #     "shape": (81,3),
+            #     "names": ["marker_id", "xyz"],
+            # },
             # 关节和动作特征
             "observation.state": {
                 "dtype": "float32",
@@ -163,11 +200,6 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                     "right_gripper"
                     ],
             },
-            # "timestamp": {
-            #     "dtype": "float32",
-            #     "shape": (1,),
-            #     "names": ["timestamp"],
-            # },
         },
         image_writer_threads=10,
         image_writer_processes=5,
@@ -191,7 +223,6 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
             continue
         
         print(f"进入文件夹：{subdir_path}")
-
 
         # 获取所有episode文件夹
         episode_folders = sorted(glob(os.path.join(subdir_path, "episode_*")))
@@ -221,11 +252,17 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                     "observation.images.cam_left_wrist": "img_left_camera-images-rgb.mp4",
                     "observation.images.cam_right_wrist": "img_right_camera-images-rgb.mp4"
                 }
-                tactile_video_file = {
+                tactile_raw_video_file = {
                     "observation.images.left1_warped-images": "left1_warped-images-rgb.mp4",
                     "observation.images.left2_warped-images": "left2_warped-images-rgb.mp4",
                     "observation.images.right1_warped-images": "right1_warped-images-rgb.mp4",
                     "observation.images.right2_warped-images": "right2_warped-images-rgb.mp4"
+                }
+                tactile_depth_video_file = {
+                    "observation.images.left1_warped-depth-images": "left1_depth.mp4",
+                    "observation.images.left2_warped-depth-images": "left2_depth.mp4",
+                    "observation.images.right1_warped-depth-images": "right1_depth.mp4",
+                    "observation.images.right2_warped-depth-images": "right2_depth.mp4"
                 }
 
                 # 加载所有视频帧
@@ -233,10 +270,23 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                 for key, filename in video_files.items():
                     video_path = os.path.join(episode_folder, filename)
                     video_frames[key] = extract_video_to_frames(video_path)
-                
-                for key, filename in tactile_video_file.items():
+                # 加载触觉Raw图像视频帧
+                for key, filename in tactile_raw_video_file.items():
                     video_path = os.path.join(episode_folder, filename)
                     video_frames[key] = extract_video_to_frames(video_path, target_height=240, target_width=240)
+                # 加载触觉Depth图像视频帧（拷贝成3通道的数据）
+                for key, filename in tactile_depth_video_file.items():
+                    video_path = os.path.join(episode_folder, filename)
+                    video_frames[key] = extract_video_to_frames(video_path, target_height=240, target_width=240)
+                # 加载触觉marker帧
+                left1_tracking = np.load(os.path.join(episode_folder, "left1_tracking.npy"))
+                left1_tracking = [left1_tracking[i] for i in range(left1_tracking.shape[0])]
+                left2_tracking = np.load(os.path.join(episode_folder, "left2_tracking.npy"))
+                left2_tracking = [left2_tracking[i] for i in range(left2_tracking.shape[0])]
+                right1_tracking = np.load(os.path.join(episode_folder, "right1_tracking.npy"))
+                right1_tracking = [right1_tracking[i] for i in range(right1_tracking.shape[0])]
+                # right2_tracking = np.load(os.path.join(episode_folder, "right2_tracking.npy"))
+                # right2_tracking = [right2_tracking[i] for i in range(right2_tracking.shape[0])]
 
                 # 检查所有数据的长度是否一致
                 lengths = [
@@ -245,6 +295,14 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                     len(action_left_pos),
                     len(action_right_pos),
                     len(timestamps),
+                    len(video_frames["observation.images.left1_warped-depth-images"]),
+                    len(video_frames["observation.images.left2_warped-depth-images"]),
+                    len(video_frames["observation.images.right1_warped-depth-images"]),
+                    len(video_frames["observation.images.right2_warped-depth-images"]),
+                    len(left1_tracking),
+                    len(left2_tracking),
+                    len(right1_tracking),
+                    # len(right2_tracking),
                     len(video_frames["observation.images.cam_high"])
                 ]
                 if len(set(lengths)) > 1:
@@ -271,15 +329,26 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                         "observation.images.cam_front": video_frames["observation.images.cam_front"][step_idx],
                         "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
                         "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
+                        # 触觉Raw图像
                         "observation.images.left1_warped-images": video_frames["observation.images.left1_warped-images"][step_idx],
                         "observation.images.left2_warped-images": video_frames["observation.images.left2_warped-images"][step_idx],
                         "observation.images.right1_warped-images": video_frames["observation.images.right1_warped-images"][step_idx],
                         "observation.images.right2_warped-images": video_frames["observation.images.right2_warped-images"][step_idx],
-                        
+                        # Depth图像
+                        "observation.images.left1_warped-depth-images": video_frames["observation.images.left1_warped-depth-images"][step_idx],
+                        "observation.images.left2_warped-depth-images": video_frames["observation.images.left2_warped-depth-images"][step_idx],
+                        "observation.images.right1_warped-depth-images": video_frames["observation.images.right1_warped-depth-images"][step_idx],
+                        "observation.images.right2_warped-depth-images": video_frames["observation.images.right2_warped-depth-images"][step_idx],
+
+                        # marker数据
+                        "observation.left1_warped-marker": left1_tracking[step_idx],
+                        "observation.left2_warped-marker": left2_tracking[step_idx],
+                        "observation.right1_warped-marker": right1_tracking[step_idx],
+                        # "observation.right2_warped-marker": right2_tracking[step_idx],
+
                         # 关节和动作数据
                         "observation.state": state,
                         "actions": actions,
-                        # "timestamp": timestamps[step_idx],
                         
                         # 从元数据添加任务信息
                         "task": metadata.get("prompt", "prompt"),
@@ -295,15 +364,6 @@ def main(root_dir: str = "/data/vitai_vtla_dataset/raw_dataset/blue_cylinder_pic
                 error_num = error_num + 1
                 print(f"处理episode时出错 {episode_folder}: {str(e)} ,总计错误了 {error_num} 个")
                 continue
-
-    # 可选：推送到Hugging Face Hub
-    if push_to_hub:
-        dataset.push_to_hub(
-            tags=["clean_table", "robot_manipulation"],
-            private=False,
-            push_videos=True,
-            license="apache-2.0",
-        )
 
     print("数据集转换完成！")
 

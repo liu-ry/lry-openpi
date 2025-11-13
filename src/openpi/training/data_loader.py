@@ -3,6 +3,7 @@ import logging
 import multiprocessing
 import os
 import typing
+from pathlib import Path
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
@@ -160,7 +161,7 @@ def create_torch_dataset(
          # 创建单一 LeRobotDataset            
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
         dataset = lerobot_dataset.LeRobotDataset(
-            data_config.repo_id,
+            repo_id=repo_id,
             delta_timestamps={
                 key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
             },
@@ -173,12 +174,13 @@ def create_torch_dataset(
         if isinstance(dataset, lerobot_dataset.MultiLeRobotDataset):
             # 合并所有子数据集的 tasks：{task_idx + 子数据集偏移: prompt}（避免 task_idx 冲突）
             merged_tasks = {}
-            task_idx_offset = 50  # 偏移量：确保不同数据集的 task_idx 不重复
+            task_idx_offset = 1000  # 偏移量：确保不同数据集的 task_idx 不重复
             for dataset_idx, repo_id in enumerate(repo_ids):
                 sub_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
                 # 偏移公式：偏移后 task_index = 数据集索引 × 偏移系数 + 原 task_index
                 for sub_task_idx, prompt in sub_meta.tasks.items():
                     global_task_idx = dataset_idx * task_idx_offset + sub_task_idx
+                    print(f"========>>>>>>>> global_task_idx: {global_task_idx}, prompt: {prompt}")
                     merged_tasks[global_task_idx] = prompt
         else:
             # 单数据集：直接使用原有 tasks
@@ -256,6 +258,126 @@ def transform_iterable_dataset(
         ],
         is_batched=is_batched,
     )
+
+
+def create_trainval_data_loader(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+    validation_split: float = 0.1,
+) -> (DataLoader[tuple[_model.Observation, _model.Actions]],
+      DataLoader[tuple[_model.Observation, _model.Actions]]):
+    """Create a data loader for training."""
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    return create_trainval_torch_data_loader(
+        data_config,
+        model_config=config.model,
+        action_horizon=config.model.action_horizon,
+        batch_size=config.batch_size,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        skip_norm_stats=skip_norm_stats,
+        validation_split=validation_split
+    )
+
+
+def create_trainval_torch_data_loader(
+        data_config: _config.DataConfig,
+        model_config: _model.BaseModelConfig,
+        action_horizon: int,
+        batch_size: int,
+        *,
+        sharding: jax.sharding.Sharding | None = None,
+        skip_norm_stats: bool = False,
+        shuffle: bool = False,
+        num_batches: int | None = None,
+        num_workers: int = 0,
+        seed: int = 0,
+        validation_split: float = 0.1,
+        is_validation: bool = False,
+) -> (DataLoader[tuple[_model.Observation, _model.Actions]],
+      DataLoader[tuple[_model.Observation, _model.Actions]]):
+    """Create a data loader for training with train/validation split support.
+
+    Args:
+        data_config: The data configuration.
+        model_config: The model configuration.
+        action_horizon: The action horizon.
+        batch_size: The batch size.
+        sharding: The sharding to use for the data loader.
+        skip_norm_stats: Whether to skip data normalization.
+        shuffle: Whether to shuffle the data before splitting.
+        num_batches: Number of batches to return.
+        num_workers: Number of worker processes.
+        seed: Random seed for reproducibility.
+        validation_split: Fraction of data to use for validation (0.0-1.0).
+        is_validation: Whether to create validation loader (True) or training loader (False).
+    """
+    # Create full dataset
+    full_dataset = create_torch_dataset(data_config, action_horizon, model_config)
+
+    N = data_config.n_hours
+    print(f"Creating data loader with N={N} hours of data.")
+    if N is not None:
+        dataset_size = len(full_dataset)
+        indices = list(range(dataset_size))
+        split = N * 3600 * 30 # N hours of data at 30 Hz
+
+        # Create subset dataset
+        dataset = torch.utils.data.Subset(full_dataset, indices[:split])
+    else:
+        dataset = full_dataset
+
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+
+
+    # Shuffle indices before splitting to ensure random train/val split
+    if shuffle:
+        rng = np.random.RandomState(seed)
+        rng.shuffle(indices)
+
+    split = int(np.floor(validation_split * dataset_size))
+
+    # Create subset dataset
+    val_dataset = torch.utils.data.Subset(dataset, indices[:split])
+    train_dataset = torch.utils.data.Subset(dataset, indices[split:])
+
+    # Apply transformations
+    train_dataset = transform_dataset(train_dataset, data_config, skip_norm_stats=skip_norm_stats)
+    val_dataset = transform_dataset(val_dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+
+    # Create data loader
+    train_data_loader = TorchDataLoader(
+        train_dataset,
+        local_batch_size=batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=shuffle,  # Don't shuffle validation set
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+    )
+
+    val_data_loader = TorchDataLoader(
+        val_dataset,
+        local_batch_size=batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=False,  # Don't shuffle validation set
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+    )
+
+    return DataLoaderImpl(data_config, train_data_loader), DataLoaderImpl(data_config, val_data_loader)
+
 
 
 def create_data_loader(
@@ -337,7 +459,21 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    full_dataset = create_torch_dataset(data_config, action_horizon, model_config)
+
+    N = data_config.n_hours
+    print(f"Creating data loader with N={N} hours of data.")
+    if N is not None:
+        dataset_size = len(full_dataset)
+        indices = list(range(dataset_size))
+        
+        split = N * 3600 * 30 # N hours of data at 30 Hz
+
+        # Create subset dataset
+        dataset = torch.utils.data.Subset(full_dataset, indices[:split])
+    else:
+        dataset = full_dataset
+
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

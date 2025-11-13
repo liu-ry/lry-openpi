@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -14,7 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
-import wandb
+# import wandb
+from torch.utils.tensorboard import SummaryWriter  # 替换 wandb
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -26,9 +28,11 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+from typing import Protocol, runtime_checkable
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -49,32 +53,54 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
+def init_tensorboard(log_dir: str) -> SummaryWriter:
+    """Initialize TensorBoard SummaryWriter."""
+    return SummaryWriter(log_dir=log_dir)
 
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+# def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+#     if not enabled:
+#         wandb.init(mode="disabled")
+#         return
+#
+#     ckpt_dir = config.checkpoint_dir
+#     if not ckpt_dir.exists():
+#         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+#     if resuming:
+#         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+#         wandb.init(id=run_id, resume="must", project=config.project_name)
+#     else:
+#         wandb.init(
+#             name=config.exp_name,
+#             config=dataclasses.asdict(config),
+#             mode="offline",
+#             project=config.project_name,
+#         )
+#         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+#
+#     if log_code:
+#         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
+
+    ###################### 新增 MLP 层参数的初始化 ######################
+    # 检查是否缺少 'marker_proj'，若缺少则初始化
+    if "marker_proj" not in loaded_params:
+        # 从预期结构中获取 'marker_proj' 的形状信息（ShapeDtypeStruct）
+        marker_proj_shape = params_shape["marker_proj"]
+        # 生成随机种子（固定种子确保可复现）
+        rng = jax.random.PRNGKey(42)
+        # 初始化 MLP 层参数（假设 MLP 是字典结构，包含 'w' 和 'b' 等键）
+        # 这里根据你的 MLP 实际结构调整（如线性层的权重和偏置）
+        loaded_params["marker_proj"] = {
+            "kernel": jax.random.normal(rng, (243, 1024), "float32") * 0.02,
+            "bias": jnp.zeros(1024, "float32"),
+        }
+    #################################################################
+
     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
@@ -82,12 +108,33 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
+@runtime_checkable
+class OptimizerConfig(Protocol):
+    def create(
+        self,
+        lr: optax.ScalarOrSchedule,
+        weight_decay_mask: at.PyTree | None = None,
+    ) -> optax.GradientTransformation: ...
+
+
+def create_optimizer(
+    optimizer: OptimizerConfig,
+    lr_schedule: optax.Schedule,  # 改为接收实例
+    weight_decay_mask: at.PyTree | None = None
+) -> optax.GradientTransformation:
+    return optimizer.create(lr_schedule, weight_decay_mask)
+
+
 
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+
+    lr_schedule = config.lr_schedule.create()  # 提前创建
+    tx = create_optimizer(config.optimizer, lr_schedule,weight_decay_mask=None)
+
+    # tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -113,6 +160,7 @@ def init_train_state(
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
+            lr_schedule=lr_schedule
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -147,9 +195,10 @@ def train_step(
 
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
+        train=True
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=train)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -185,12 +234,36 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+
+
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
     return new_state, info
+
+
+def get_loader_info(loader):
+    try:
+        # 尝试获取底层 TorchDataLoader 或 RLDSDataLoader
+        internal_loader = loader._data_loader
+        if hasattr(internal_loader, 'torch_loader'):
+            # 如果是 TorchDataLoader
+            torch_loader = internal_loader.torch_loader
+            return {
+                'num_batches': len(torch_loader),
+                'total_samples': len(torch_loader.dataset),
+                'batch_size': torch_loader.batch_size
+            }
+        elif hasattr(internal_loader, '_dataset'):
+            # 如果是 RLDSDataLoader
+            return {
+                'info': 'RLDS数据集通常不支持精确长度查询'
+            }
+    except Exception as e:
+        return {'error': str(e)}
+    return {'info': '无法确定数据加载器信息'}
 
 
 def main(config: _config.TrainConfig):
@@ -217,37 +290,82 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    
+    # 保存配置到 checkpoint 目录
+    if not resuming:
+        config_save_path = config.checkpoint_dir / "train_config.json"
+        import json
+        with open(config_save_path, 'w') as f:
+            json.dump(dataclasses.asdict(config), f, indent=2, default=str)
+        logging.info(f"Saved training config to: {config_save_path}")
+        logging.info(f'config: {config}')
 
-    data_loader = _data_loader.create_data_loader(
+        import shutil
+        src_config_path = os.path.join(os.path.dirname(__file__), '../src/openpi/training/config.py')
+        dst_config_path = os.path.join(config.checkpoint_dir, 'config.py')
+        shutil.copyfile(src_config_path, dst_config_path)
+        logging.info(f"Copied {src_config_path} to {dst_config_path}.")
+    
+    tb_writer = init_tensorboard(log_dir=str(config.checkpoint_dir / "tensorboard"))
+
+    # 创建训练和验证数据加载器
+    train_data_loader, val_data_loader = _data_loader.create_trainval_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
+        validation_split=0.05
     )
-    data_iter = iter(data_loader)
-    batch = next(data_iter)
+
+
+    train_info = get_loader_info(train_data_loader)
+    val_info = get_loader_info(val_data_loader)
+    logging.info(f"训练集信息: {train_info}")
+    logging.info(f"验证集信息: {val_info}")
+
+    train_data_iter = iter(train_data_loader)
+    val_data_iter = iter(val_data_loader)
+
+    # 获取第一批数据用于初始化
+    batch = next(train_data_iter)
+    val_batch = next(val_data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # 将第一批图像保存到 TensorBoard
+    images_to_log = np.concatenate(
+        [np.array(img[0]) for img in batch[0].images.values()],  # 只取第一个样本
+        axis=1,
+    )
+
+    tb_writer.add_image("camera_views", images_to_log, global_step=0, dataformats="HWC")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, train_data_loader)
 
+    # 创建训练和验证的jit函数
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
+    # 创建验证函数
+    @jax.jit
+    def compute_val_loss(state, batch):
+        model = nnx.merge(state.model_def, state.params)
+        model.eval()
+
+        @at.typecheck
+        def loss_fn(model, rng, observation, actions):
+            return model.compute_loss(rng, observation, actions, train=False)
+
+        observation, actions = batch
+        val_loss = jnp.mean(loss_fn(model, train_rng, observation, actions))
+        return val_loss
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -259,20 +377,56 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        # 训练步骤
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+        # 定期记录和验证
         if step % config.log_interval == 0:
+            current_lr = float(jax.device_get(train_state.lr_schedule(train_state.step)))
+
+            # 记录到TensorBoard
+            if jax.process_index() == 0:  # 只在主进程记录
+                tb_writer.add_scalar("train/lr", current_lr, global_step=step)
+
+            # 计算训练指标
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
 
+            # 记录训练指标到TensorBoard
+            for k, v in reduced_info.items():
+                tb_writer.add_scalar(f"train/{k}", v, global_step=step)
+
+            # 计算验证集loss
+            if step % 2000 == 0:
+                val_losses = []
+                for _ in range(100):  # 最多验证100个batch
+                    try:
+                        val_batch = next(val_data_iter)
+                    except StopIteration:
+                        val_data_iter = iter(val_data_loader)
+                        val_batch = next(val_data_iter)
+                    val_loss = compute_val_loss(train_state, val_batch)
+                    val_losses.append(val_loss)
+                avg_val_loss = np.mean(np.array(val_losses))
+                tb_writer.add_scalar("val/loss", avg_val_loss, global_step=step)
+                pbar.write(f"Validation at step {step}: loss={avg_val_loss:.4f}")
+
+            infos = []
+
+        # 获取下一批训练数据
+        try:
+            batch = next(train_data_iter)
+        except StopIteration:
+            train_data_iter = iter(train_data_loader)
+            batch = next(train_data_iter)
+
+
+        # 定期保存检查点
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(checkpoint_manager, train_state, train_data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
